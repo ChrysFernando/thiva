@@ -9,6 +9,9 @@ Usage:
 
 import os
 import sys
+import re
+import threading
+import queue
 
 from dotenv import load_dotenv
 
@@ -46,24 +49,31 @@ SYSTEM_PROMPT_TEMPLATE = (
 )
 
 
-def speak(text: str, voice: str, region: str, key: str):
-    """Speak text using Azure TTS."""
+def create_synthesizer(voice: str, region: str, key: str):
+    """Create a reusable Azure TTS synthesizer."""
     speech_config = speechsdk.SpeechConfig(subscription=key, region=region)
     speech_config.speech_synthesis_voice_name = voice
-
-    # Use default speaker output
     audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
-    synthesizer = speechsdk.SpeechSynthesizer(
+    return speechsdk.SpeechSynthesizer(
         speech_config=speech_config, audio_config=audio_config
     )
 
-    result = synthesizer.speak_text_async(text).get()
 
-    if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-        pass  # Success
-    elif result.reason == speechsdk.ResultReason.Canceled:
-        details = result.cancellation_details
-        print(f"  [TTS Error: {details.reason} - {details.error_details}]")
+# Sentence-ending punctuation pattern (handles ., !, ?, and their unicode equivalents)
+SENTENCE_END = re.compile(r'[.!?。！？]\s*')
+
+
+def tts_worker(tts_queue: queue.Queue, synthesizer):
+    """Background thread that speaks sentences from the queue in order."""
+    while True:
+        chunk = tts_queue.get()
+        if chunk is None:  # Poison pill — we're done
+            break
+        result = synthesizer.speak_text_async(chunk).get()
+        if result.reason == speechsdk.ResultReason.Canceled:
+            details = result.cancellation_details
+            print(f"\n  [TTS Error: {details.reason} - {details.error_details}]")
+        tts_queue.task_done()
 
 
 def main():
@@ -98,6 +108,9 @@ def main():
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     conversation_history = []
 
+    # Create a reusable synthesizer (avoids re-creating it every turn)
+    synthesizer = create_synthesizer(voice, AZURE_SPEECH_REGION, AZURE_SPEECH_KEY)
+
     while True:
         user_input = input(f"\nYou: ").strip()
         if not user_input:
@@ -114,8 +127,16 @@ def main():
 
         conversation_history.append({"role": "user", "content": user_input})
 
-        # Get Claude response
+        # Set up background TTS queue — speaks sentences as they arrive
+        tts_queue = queue.Queue()
+        tts_thread = threading.Thread(
+            target=tts_worker, args=(tts_queue, synthesizer), daemon=True
+        )
+        tts_thread.start()
+
+        # Stream Claude response, sending each sentence to TTS immediately
         print("Agent: ", end="", flush=True)
+        sentence_buffer = ""
         with client.messages.stream(
             model="claude-sonnet-4-20250514",
             max_tokens=256,
@@ -125,14 +146,24 @@ def main():
             full_response = ""
             for token in stream.text_stream:
                 full_response += token
+                sentence_buffer += token
                 print(token, end="", flush=True)
+
+                # Check if buffer contains a complete sentence
+                if SENTENCE_END.search(sentence_buffer):
+                    tts_queue.put(sentence_buffer.strip())
+                    sentence_buffer = ""
+
+        # Send any remaining text that didn't end with punctuation
+        if sentence_buffer.strip():
+            tts_queue.put(sentence_buffer.strip())
 
         print()  # newline after response
         conversation_history.append({"role": "assistant", "content": full_response})
 
-        # Speak the response
-        print("  [Speaking...]")
-        speak(full_response, voice, AZURE_SPEECH_REGION, AZURE_SPEECH_KEY)
+        # Wait for all sentences to finish speaking, then clean up
+        tts_queue.put(None)  # Signal worker to exit
+        tts_thread.join()
 
 
 if __name__ == "__main__":
