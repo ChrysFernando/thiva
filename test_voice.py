@@ -1,7 +1,7 @@
 """
 Local voice test for the Thiva agent.
 Type your messages and hear the agent's spoken response via Azure TTS.
-Same Claude + knowledge-base pipeline as the live server.
+Same Claude + knowledge-base + eZee tools pipeline as the live server.
 
 Usage:
     python test_voice.py
@@ -10,8 +10,11 @@ Usage:
 import os
 import sys
 import re
+import json
+import asyncio
 import threading
 import queue
+from datetime import date
 
 from dotenv import load_dotenv
 
@@ -32,6 +35,7 @@ if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
 import azure.cognitiveservices.speech as speechsdk
 from anthropic import Anthropic
 from knowledge_base import retrieve_context, initialize_kb
+from tools import get_tools, execute_tool
 
 # Language configs (same as server.py)
 LANGUAGES = {
@@ -41,9 +45,13 @@ LANGUAGES = {
 }
 
 SYSTEM_PROMPT_TEMPLATE = (
-    "You are a warm, helpful customer service agent for Winrich. "
+    "You are a warm, helpful hotel booking agent. "
     "You speak ONLY in {language}. "
-    "You help customers with product inquiries, orders, complaints, and general questions. "
+    "Today's date is {today}. "
+    "You help guests check room availability and make reservations. "
+    "When a guest wants to book, collect: dates, name, and phone number. "
+    "Always check availability before creating a booking. "
+    "Confirm all details with the guest before finalizing a booking. "
     "Be concise - keep responses under 2 sentences for voice. "
     "Use the provided knowledge base context to answer questions accurately."
 )
@@ -76,6 +84,65 @@ def tts_worker(tts_queue: queue.Queue, synthesizer):
         tts_queue.task_done()
 
 
+def run_tool_loop(client, augmented_system, conversation_history, tools):
+    """
+    Run Claude with tool use. Handles tool calls synchronously, then
+    streams the final text response. Returns the final text.
+    """
+    max_tool_rounds = 5
+
+    for _ in range(max_tool_rounds):
+        api_kwargs = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "system": augmented_system,
+            "messages": conversation_history,
+        }
+        if tools:
+            api_kwargs["tools"] = tools
+
+        response = client.messages.create(**api_kwargs)
+
+        tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+        text_blocks = [b for b in response.content if b.type == "text"]
+
+        if tool_use_blocks:
+            # Print any interim text
+            interim = " ".join(b.text for b in text_blocks)
+            if interim.strip():
+                print(interim, end=" ", flush=True)
+
+            # Add assistant message to history
+            conversation_history.append({
+                "role": "assistant",
+                "content": [b.model_dump() for b in response.content],
+            })
+
+            # Execute tools (async → run in event loop)
+            tool_results = []
+            for tb in tool_use_blocks:
+                print(f"\n  [Calling {tb.name}...]", flush=True)
+                result_str = asyncio.get_event_loop().run_until_complete(
+                    execute_tool(tb.name, tb.input)
+                )
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tb.id,
+                    "content": result_str,
+                })
+
+            conversation_history.append({
+                "role": "user",
+                "content": tool_results,
+            })
+            continue
+
+        # No tool calls — return text for streaming
+        return None  # Signal to caller: stream the final response
+
+    return None
+
+
 def main():
     # Initialize knowledge base
     docs_dir = os.environ.get("KB_DOCS_DIRECTORY", "knowledge_docs")
@@ -99,9 +166,15 @@ def main():
     language = config["name"]
     voice = config["voice"]
 
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(language=language)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        language=language, today=date.today().isoformat()
+    )
+    tools = get_tools()
 
-    print(f"\nLanguage: {language} | Voice: {voice}")
+    if tools:
+        print(f"\nLanguage: {language} | Voice: {voice} | eZee: connected")
+    else:
+        print(f"\nLanguage: {language} | Voice: {voice} | eZee: not configured")
     print("Type your messages below. Type 'quit' to exit.\n")
     print("-" * 50)
 
@@ -127,6 +200,11 @@ def main():
 
         conversation_history.append({"role": "user", "content": user_input})
 
+        print("Agent: ", end="", flush=True)
+
+        # Run tool loop (handles tool calls, adds to history)
+        run_tool_loop(client, augmented_system, conversation_history, tools)
+
         # Set up background TTS queue — speaks sentences as they arrive
         tts_queue = queue.Queue()
         tts_thread = threading.Thread(
@@ -134,15 +212,18 @@ def main():
         )
         tts_thread.start()
 
-        # Stream Claude response, sending each sentence to TTS immediately
-        print("Agent: ", end="", flush=True)
+        # Stream the final text response
+        api_kwargs = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "system": augmented_system,
+            "messages": conversation_history,
+        }
+        if tools:
+            api_kwargs["tools"] = tools
+
         sentence_buffer = ""
-        with client.messages.stream(
-            model="claude-sonnet-4-20250514",
-            max_tokens=256,
-            system=augmented_system,
-            messages=conversation_history,
-        ) as stream:
+        with client.messages.stream(**api_kwargs) as stream:
             full_response = ""
             for token in stream.text_stream:
                 full_response += token
