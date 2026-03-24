@@ -35,7 +35,7 @@ from knowledge_base import retrieve_context, initialize_kb
 
 # Language configs (same as server.py)
 LANGUAGES = {
-    "1": {"name": "Sinhala", "voice": "si-LK-ThiliniNeural", "lang_code": "si-LK"},
+    "1": {"name": "Sinhala", "voice": "si-LK-SameeraNeural", "lang_code": "si-LK"},
     "2": {"name": "English", "voice": "en-US-JennyNeural", "lang_code": "en-US"},
     "3": {"name": "Tamil", "voice": "ta-IN-PallaviNeural", "lang_code": "ta-IN"},
 }
@@ -60,7 +60,7 @@ def create_synthesizer(voice: str, region: str, key: str):
 
 
 # Sentence-ending punctuation pattern (handles ., !, ?, and their unicode equivalents)
-SENTENCE_END = re.compile(r'[.!?。！？]\s*')
+SENTENCE_END = re.compile(r'[.?]\s*')
 
 
 def tts_worker(tts_queue: queue.Queue, synthesizer):
